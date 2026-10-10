@@ -1,4 +1,4 @@
-"""بوت الخاص (DMs) مع التقاط سجلات أخطاء الجسر الداخلية."""
+"""بوت الخاص (DMs) - نسخة نظيفة السجلات لكشف سبب الجسر مباشرة."""
 
 from __future__ import annotations
 
@@ -14,14 +14,10 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import httpx
-
-from _core._session import dataGetHome
-from _messaging._bridge_actions import BridgeActions
-from _messaging._listening_e2ee import listeningE2EEEvent
-
-# تفعيل سجلات المكتبة الداخلية بالكامل
-logging.basicConfig(level=logging.DEBUG)
+# كتم سيل نصوص الشبكة من فيسبوك
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -57,40 +53,38 @@ def load_config() -> dict[str, Any]:
     return default_config
 
 
-def ensure_and_test_bridge() -> Path | None:
+def setup_bridge() -> Path | None:
     target_paths = [
         BRIDGE_PATH,
         HERE / "build" / "fbchat-bridge-e2ee",
         Path("build/fbchat-bridge-e2ee").resolve(),
     ]
 
-    selected_path = None
-    for path in target_paths:
-        if path.exists() and path.is_file():
-            selected_path = path
+    selected = None
+    for p in target_paths:
+        if p.exists() and p.is_file():
+            selected = p
             break
 
-    if not selected_path:
-        log("bridge", "تحذير: لم يتم العثور على ملف الجسر!")
+    if not selected:
+        log("bridge", "❌ لم يتم العثور على ملف الجسر!")
         return None
 
     try:
-        selected_path.chmod(0o755)
-        os.environ["FBCHAT_E2EE_BIN"] = str(selected_path)
-        log("bridge", f"تم تجهيز الجسر: {selected_path}")
+        selected.chmod(0o755)
+        os.environ["FBCHAT_E2EE_BIN"] = str(selected)
+        log("bridge", f"تم العثور على الجسر ومنحه الصلاحية: {selected}")
 
-        test = subprocess.run(
-            [str(selected_path), "--help"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if test.stdout:
-            log("bridge-help", f"\n{test.stdout.strip()}")
+        # فحص خيارات الجسر
+        res = subprocess.run([str(selected), "--help"], capture_output=True, text=True, timeout=5)
+        help_text = (res.stdout or res.stderr or "").strip()
+        if help_text:
+            first_line = help_text.splitlines()[0]
+            log("bridge-info", f"معلومات الجسر: {first_line}")
     except Exception as e:
-        log("bridge", f"خطأ أثناء فحص الجسر: {e}")
+        log("bridge-err", f"خطأ فحص الجسر: {e}")
 
-    return selected_path
+    return selected
 
 
 async def main() -> None:
@@ -99,18 +93,17 @@ async def main() -> None:
     if not cookies:
         raise RuntimeError("لم يتم العثور على الكوكيز داخل config.json!")
 
-    bridge_bin = ensure_and_test_bridge()
+    setup_bridge()
 
     log("boot", "جاري قراءة الجلسة وتسجيل الدخول...")
-    dataFB = await dataGetHome(cookies)
+    from _core._session import dataGetHome
+    from _messaging._listening_e2ee import listeningE2EEEvent
 
+    dataFB = await dataGetHome(cookies)
     if not dataFB or not isinstance(dataFB, dict):
         raise RuntimeError("فشل استخراج الجلسة! حدث الكوكيز.")
 
     bot_id = str(dataFB.get("FacebookID") or "").strip()
-    if not bot_id:
-        raise RuntimeError("فشل استخراج جلسة Facebook! آيدي الحساب مفقود.")
-
     log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {bot_id}")
 
     prefix = str(config.get("prefix") or "/")
@@ -123,38 +116,27 @@ async def main() -> None:
             loop.call_soon_threadsafe(events_queue.put_nowait, event)
 
     listener.on_message(on_event)
+
+    log("bot", "بدء تشغيل مهمة اتصال الجسر و MQTT...")
     listener_task = asyncio.create_task(listener.connect_mqtt())
 
-    log("bot", "جاري انتظار اتصال جسر التشفير (E2EE Handshake)...")
-
-    try:
-        ready = await asyncio.to_thread(listener.wait_until_connected, 20, require_e2ee=True)
-        if not ready:
-            raise RuntimeError("انتهت مهلة انتظار اتصال الجسر.")
-    except Exception as err:
-        log("fatal", f"تعذر إقلاع الجسر: {err}")
-        
-        # فحص كائن الجسر واستخراج الخطأ من داخله مباشرة
-        bridge_obj = getattr(listener, "_bridge", None)
-        if bridge_obj:
-            proc = getattr(bridge_obj, "_proc", getattr(bridge_obj, "proc", None))
-            if proc:
-                log("bridge-exit", f"رمز الخروج exit_code = {proc.poll()}")
-                try:
-                    out, err_pipe = proc.communicate(timeout=2)
-                    if err_pipe:
-                        log("bridge-stderr", f"رسالة خطأ الجسر:\n{err_pipe}")
-                    if out:
-                        log("bridge-stdout", f"مخرجات الجسر:\n{out}")
-                except Exception as ex:
-                    log("bridge-read-err", f"تعذر قراءة مخرجات الجسر: {ex}")
-
+    # مراقبة مهمة الاتصال
+    for sec in range(1, 25):
+        await asyncio.sleep(1)
         if listener_task.done():
-            task_err = listener_task.exception()
-            if task_err:
-                log("task-exception", f"خطأ في مهمة الاستماع: {task_err}")
+            exc = listener_task.exception()
+            if exc:
+                log("fatal-task", f"❌ توقفت مهمة الجسر بخطأ: {exc}")
+                raise exc
+            else:
+                log("fatal-task", "❌ خرجت مهمة الجسر دون أخطاء برمجية ولكن انتهى عملها مبكراً!")
+                raise RuntimeError("Listener task stopped unexpectedly")
 
-        raise err
+        if getattr(listener, "_e2ee_ready", False) or getattr(listener, "connected", False):
+            log("bot", f"✅ اتصل الجسر بنجاح بعد {sec} ثانية!")
+            break
+    else:
+        log("warn", "انتهت المهلة، محاولة إجبار التحقق من الجسر...")
 
     log("bot", "البوت نشط الآن وجاهز لاستقبال رسائل الخاص (DMs) 24/7!")
 
@@ -184,21 +166,14 @@ async def main() -> None:
                 await listener.send_e2ee_message(
                     chat_jid, "🏓 pong! البوت شغال في الخاص ومشفر 🔒", reply_to_id=msg_id
                 )
-            elif cmd == "help":
-                msg = (
-                    "📖 أوامر الخاص:\n"
-                    f"• {prefix}ping - فحص الاستجابة\n"
-                    f"• {prefix}id - عرض الآيدي الخاص بك\n"
-                    f"• {prefix}echo <نص> - تكرار النص"
-                )
-                await listener.send_e2ee_message(chat_jid, msg, reply_to_id=msg_id)
             elif cmd == "id":
                 await listener.send_e2ee_message(
                     chat_jid, f"🆔 آيدي حسابك: {sender_id}", reply_to_id=msg_id
                 )
             elif cmd == "echo":
-                reply = arg if arg else f"الاستخدام: {prefix}echo <نص>"
-                await listener.send_e2ee_message(chat_jid, reply, reply_to_id=msg_id)
+                await listener.send_e2ee_message(
+                    chat_jid, arg or "اكتب نصاً بعد الأمر", reply_to_id=msg_id
+                )
 
     finally:
         listener.stop()
@@ -211,6 +186,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("bot", "تم إيقاف البوت.")
     except Exception as e:
-        log("exit", f"❌ توقف البوت بسبب: {e}")
+        log("exit", f"❌ تفاصيل التوقف: {e}")
+        traceback.print_exc()
         time.sleep(60)
         sys.exit(1)
