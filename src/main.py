@@ -1,4 +1,4 @@
-"""بوت الخاص (DMs) مع دعم E2EE عبر Go Bridge."""
+"""بوت الخاص (DMs) مع دعم E2EE وتفعيل الصلاحيات تلقائياً."""
 
 from __future__ import annotations
 
@@ -51,24 +51,48 @@ def load_config() -> dict[str, Any]:
     return default_config
 
 
+def ensure_bridge_permissions() -> None:
+    """منح صلاحيات التشغيل لجسر Go تلقائياً لتفادي PermissionError."""
+    target_paths = [
+        BRIDGE_PATH,
+        HERE / "build" / "fbchat-bridge-e2ee",
+        Path("build/fbchat-bridge-e2ee").resolve(),
+    ]
+
+    for path in target_paths:
+        if path.exists() and path.is_file():
+            try:
+                # منح صلاحية التنفيذ الكاملة rwxr-xr-x (0o755)
+                path.chmod(0o755)
+                os.environ["FBCHAT_E2EE_BIN"] = str(path)
+                log("bridge", f"تم العثور على جسر التشفير ومنحه صلاحية التشغيل: {path}")
+                return
+            except Exception as e:
+                log("bridge", f"تعذر تغيير صلاحية {path}: {e}")
+
+    log("bridge", "تحذير: لم يتم العثور على ملف الجسر في مسار build، سيتم محاولة التشغيل بالمسار الافتراضي.")
+
+
 async def main() -> None:
     config = load_config()
     cookies = str(config.get("cookies") or "").strip()
     if not cookies:
         raise RuntimeError("لم يتم العثور على الكوكيز داخل config.json!")
 
-    # تحديد مسار الجسر التنفيذي لضمان العثور عليه
-    if BRIDGE_PATH.exists():
-        os.environ["FBCHAT_E2EE_BIN"] = str(BRIDGE_PATH)
-        log("bridge", f"تم العثور على جسر التشفير في: {BRIDGE_PATH}")
-    else:
-        log("bridge", f"تحذير: لم يتم العثور على {BRIDGE_PATH}، سيتم البحث في المسار الافتراضي.")
+    # تفعيل الصلاحيات قبل أي محاولة تشغيل
+    ensure_bridge_permissions()
 
     log("boot", "جاري قراءة الجلسة وتسجيل الدخول...")
     dataFB = await dataGetHome(cookies)
+
+    if not dataFB or not isinstance(dataFB, dict):
+        raise RuntimeError(
+            "فشل استخراج جلسة Facebook! تأكد من تحديث الكوكيز."
+        )
+
     bot_id = str(dataFB.get("FacebookID") or "").strip()
     if not bot_id:
-        raise RuntimeError("فشل استخراج جلسة Facebook! تأكد من الكوكيز.")
+        raise RuntimeError("فشل استخراج جلسة Facebook! آيدي الحساب مفقود.")
 
     log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {bot_id}")
 
