@@ -1,4 +1,4 @@
-"""بوت الخاص (DMs) مع توجيه سجلات الجسر الحية لكشف حالة MQTT."""
+"""بوت الخاص (DMs) مع دعم E2EE والتجاوز السليم لفحص الإصدار."""
 
 from __future__ import annotations
 
@@ -8,50 +8,17 @@ import logging
 import os
 import re
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
 
-# كتم طلبات HTTP العادية فقط
+# كتم السجلات الزائدة للحفاظ على نظافة الشاشة
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# تجاوز فحص الإصدار مع طباعة العقد
+# تجاوز فحص الإصدار الشكلي فقط (دون المساس بأنبوب القراءة)
 from _messaging._listening_e2ee import _BridgeProcess, listeningE2EEEvent
-
-original_spawn = _BridgeProcess._spawn
-
-
-def hooked_spawn(self) -> None:
-    original_spawn(self)
-
-    # قراءة وطباعة كل حرف يصدره الجسر فوراً في السجلات
-    def stream_bridge_logs(pipe, label):
-        if not pipe:
-            return
-        for line in iter(pipe.readline, ""):
-            if not line:
-                break
-            text = line.strip()
-            if text:
-                print(f"[{label}] {text}", flush=True)
-
-    if getattr(self, "_proc", None):
-        threading.Thread(
-            target=stream_bridge_logs,
-            args=(self._proc.stderr, "BRIDGE-ERR"),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=stream_bridge_logs,
-            args=(self._proc.stdout, "BRIDGE-OUT"),
-            daemon=True,
-        ).start()
-
-
-_BridgeProcess._spawn = hooked_spawn
 _BridgeProcess._validate_contract = lambda self: None
 
 HERE = Path(__file__).resolve().parent
@@ -108,7 +75,7 @@ def setup_bridge() -> Path | None:
     try:
         selected.chmod(0o755)
         os.environ["FBCHAT_E2EE_BIN"] = str(selected)
-        log("bridge", f"تم تجهيز الجسر: {selected}")
+        log("bridge", f"تم تجهيز الجسر ومنحه الصلاحية: {selected}")
     except Exception as e:
         log("bridge-err", f"خطأ في الصلاحيات: {e}")
 
@@ -134,12 +101,21 @@ async def main() -> None:
     log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {bot_id}")
 
     prefix = str(config.get("prefix") or "/")
-    listener = listeningE2EEEvent(dataFB, debug_errors=True)
+    listener = listeningE2EEEvent(dataFB, debug_errors=False)
     events_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
     loop = asyncio.get_running_loop()
 
     def on_event(event: dict[str, Any]) -> None:
-        if isinstance(event, dict) and event.get("type") in {"e2eeMessage", "message"}:
+        if not isinstance(event, dict):
+            return
+        etype = event.get("type")
+
+        if etype == "ready":
+            log("status", "✅ تم الاتصال بخوادم فيسبوك واستقبال إشارة Ready!")
+        elif etype == "e2eeConnected":
+            log("status", "🔐 تم تفعيل تشفير الخاص E2EE بنجاح تام!")
+
+        if etype in {"e2eeMessage", "message"}:
             loop.call_soon_threadsafe(events_queue.put_nowait, event)
 
     listener.on_message(on_event)
@@ -147,16 +123,74 @@ async def main() -> None:
     log("bot", "بدء تشغيل مهمة اتصال الجسر بخوادم فيسبوك...")
     listener_task = asyncio.create_task(listener.connect_mqtt())
 
-    # انتظار الاتصال
-    await asyncio.sleep(5)
-    log("bot", "مراقبة استجابة الجسر عبر السجلات الحية...")
+    # انتظار إشارة ready (التي يستجيب لها الجسر في ثوانٍ معدودة)
+    ready = await asyncio.to_thread(listener.wait_until_connected, 60, require_e2ee=False)
+    if not ready:
+        log("warn", "تأخر الرد الأولي، جاري المتابعة...")
+    else:
+        log("bot", "🟢 البوت متصل الآن ويعمل في الخاص (DMs) 24/7!")
 
-    while not listener_task.done():
-        await asyncio.sleep(2)
+    try:
+        while True:
+            if listener_task.done():
+                exc = listener_task.exception()
+                if exc:
+                    log("fatal", f"توقفت مهمة الاتصال: {exc}")
+                    raise exc
 
-    exc = listener_task.exception()
-    if exc:
-        raise exc
+            try:
+                event = await asyncio.wait_for(events_queue.get(), timeout=2.0)
+            except asyncio.TimeoutError:
+                continue
+
+            data = event.get("data") or {}
+            body = data.get("text") or data.get("body") or ""
+            chat_jid = data.get("chatJid")
+            thread_id = data.get("threadId") or data.get("replyToID")
+            sender_id = str(data.get("senderId") or data.get("senderID") or data.get("userID") or "")
+            msg_id = str(data.get("id") or data.get("messageID") or "")
+
+            if not body or sender_id == bot_id:
+                continue
+
+            log("recv", f"📩 رسالة من {sender_id}: {body}")
+
+            if not str(body).startswith(prefix):
+                continue
+
+            cmd_text = str(body)[len(prefix) :].strip()
+            parts = cmd_text.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+
+            async def reply(text: str) -> None:
+                if chat_jid:
+                    await listener.send_e2ee_message(
+                        str(chat_jid), text, reply_to_id=msg_id
+                    )
+                elif thread_id:
+                    await listener.send_message(
+                        int(thread_id), text, reply_to_id=msg_id
+                    )
+
+            if cmd == "ping":
+                await reply("🏓 pong! البوت شغال في الخاص ومشفر 🔒")
+            elif cmd == "help":
+                msg = (
+                    "📖 أوامر الخاص:\n"
+                    f"• {prefix}ping - فحص الاستجابة\n"
+                    f"• {prefix}id - عرض الآيدي الخاص بك\n"
+                    f"• {prefix}echo <نص> - تكرار النص"
+                )
+                await reply(msg)
+            elif cmd == "id":
+                await reply(f"🆔 آيدي حسابك: {sender_id}")
+            elif cmd == "echo":
+                await reply(arg if arg else f"الاستخدام: {prefix}echo <نص>")
+
+    finally:
+        listener.stop()
+        await listener_task
 
 
 if __name__ == "__main__":
@@ -165,6 +199,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("bot", "تم إيقاف البوت.")
     except Exception as e:
-        log("exit", f"❌ سبب التوقف: {e}")
+        log("exit", f"❌ توقف بسبب: {e}")
         time.sleep(60)
         sys.exit(1)
