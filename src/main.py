@@ -1,10 +1,11 @@
-"""Bot mẫu async-first cho fbchat-v2 مع دعم appstate.json التلقائي."""
+"""Bot mẫu async-first cho fbchat-v2 مع المعالجة الذاتية للكوكيز والإعدادات."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
+import re
 import sys
 import time
 import traceback
@@ -47,8 +48,34 @@ _create_private_config = create_private_json_file
 _set_private_file_permissions = set_private_file_permissions
 
 
+def log(tag: str, message: str) -> None:
+    line = f"[{datetime.now():%H:%M:%S}] [{tag}] {message}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        safe_line = line.encode(encoding, errors="backslashreplace").decode(
+            encoding, errors="replace"
+        )
+        print(safe_line)
+
+
+def parse_raw_appstate(data: Any) -> str | None:
+    """تحويل أي كائن أو مصفوفة appstate إلى سطر كوكيز متصل."""
+    if not isinstance(data, list):
+        return None
+    cookies = []
+    for item in data:
+        if isinstance(item, dict):
+            key = item.get("key") or item.get("name")
+            val = item.get("value")
+            if key and val:
+                cookies.append(f"{key}={val}")
+    return "; ".join(cookies) if cookies else None
+
+
 def get_appstate_cookies() -> str | None:
-    """البحث عن ملف appstate.json وتحويله تلقائياً إلى نص الكوكيز المطلوب."""
+    """البحث عن ملف appstate.json في مسارات المشروع المختلفة وتحويله."""
     possible_paths = [
         HERE / "appstate.json",
         HERE.parent / "appstate.json",
@@ -59,55 +86,58 @@ def get_appstate_cookies() -> str | None:
             try:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, list):
-                    cookies = []
-                    for item in data:
-                        if isinstance(item, dict):
-                            key = item.get("key") or item.get("name")
-                            val = item.get("value")
-                            if key and val:
-                                cookies.append(f"{key}={val}")
-                    if cookies:
-                        cookie_str = "; ".join(cookies)
-                        log("appstate", f"تم العثور على {path.name} وتحميل الكوكيز بنجاح!")
-                        return cookie_str
+                cookie_str = parse_raw_appstate(data)
+                if cookie_str:
+                    log("appstate", f"تم قراءة الكوكيز من {path.name} بنجاح!")
+                    return cookie_str
             except Exception as e:
-                log("appstate", f"فشل قراءة {path}: {e}")
+                log("appstate", f"تعذر قراءة {path.name}: {e}")
     return None
 
 
 def load_config() -> dict[str, Any]:
-    """Đọc config và tạo template an toàn nếu chưa tồn tại."""
+    """قراءة config.json بأمان تام مع تجاوز أخطاء التنسيق وتفادي الانهيار."""
+    default_config: dict[str, Any] = {
+        "prefix": "/",
+        "admins": ["100002717697815"],
+        "cookies": "",
+        "log_message_content": False,
+        "debug_errors": False,
+    }
+
     if not CONFIG_PATH.exists():
-        template = {
-            "cookies": "",
-            "prefix": "/",
-            "admins": [],
-            "log_message_content": False,
-            "debug_errors": False,
-        }
-        _create_private_config(CONFIG_PATH, template)
-        if get_appstate_cookies():
-            return template
-        raise RuntimeError(
-            f"تم إنشاء {CONFIG_PATH}. ضع ملف appstate.json في المجلد أو اكتب الكوكيز ثم أعد التشغيل."
-        )
+        _create_private_config(CONFIG_PATH, default_config)
+        return default_config
 
     _set_private_file_permissions(CONFIG_PATH)
-    with CONFIG_PATH.open("r", encoding="utf-8") as file_handle:
-        config = json.load(file_handle)
+
+    config = default_config.copy()
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as file_handle:
+            loaded = json.load(file_handle)
+            if isinstance(loaded, dict):
+                config.update(loaded)
+    except Exception as e:
+        log("config", f"تحذير: خطأ في صياغة config.json ({e}). جاري محاولة استخراجه يدوياً...")
+        try:
+            raw_text = CONFIG_PATH.read_text(encoding="utf-8", errors="ignore")
+            # استخراج الكوكيز حتى لو كُسرت أقواس الـ JSON
+            cookie_match = re.search(r'"cookies"\s*:\s*"(.*?)"', raw_text, re.DOTALL)
+            if cookie_match:
+                config["cookies"] = cookie_match.group(1).replace("\n", " ").strip()
+        except Exception:
+            pass
+
+    # إذا تم لصق الكوكيز داخل config.json كمصفوفة بدلاً من نص
+    if isinstance(config.get("cookies"), list):
+        parsed = parse_raw_appstate(config["cookies"])
+        if parsed:
+            config["cookies"] = parsed
+
     config.setdefault("prefix", "/")
     config.setdefault("admins", [])
     config.setdefault("log_message_content", False)
     config.setdefault("debug_errors", False)
-    if not isinstance(config["prefix"], str) or not config["prefix"]:
-        raise ValueError("config.prefix phải là chuỗi không rỗng.")
-    if not isinstance(config["admins"], list):
-        raise ValueError("config.admins phải là một danh sách ID.")
-    if not isinstance(config["log_message_content"], bool):
-        raise ValueError("config.log_message_content phải là true hoặc false.")
-    if not isinstance(config["debug_errors"], bool):
-        raise ValueError("config.debug_errors phải là true hoặc false.")
     return config
 
 
@@ -119,18 +149,6 @@ def is_valid_datafb(dataFB: object) -> bool:
     return facebook_id.isdigit() and all(
         str(dataFB.get(field) or "").strip() for field in required
     )
-
-
-def log(tag: str, message: str) -> None:
-    line = f"[{datetime.now():%H:%M:%S}] [{tag}] {message}"
-    try:
-        print(line)
-    except UnicodeEncodeError:
-        encoding = sys.stdout.encoding or "utf-8"
-        safe_line = line.encode(encoding, errors="backslashreplace").decode(
-            encoding, errors="replace"
-        )
-        print(safe_line)
 
 
 class SimpleBot:
@@ -168,7 +186,7 @@ class SimpleBot:
         }
 
     async def run(self) -> None:
-        log("bot", f"Đăng nhập thành công với UID = {self.dataFB.get('FacebookID')}")
+        log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {self.dataFB.get('FacebookID')}")
         loop = asyncio.get_running_loop()
         self.listener.on_message(
             lambda event: self._forward_listener_event(loop, event)
@@ -183,12 +201,12 @@ class SimpleBot:
                 require_e2ee=False,
             )
             if not ready:
-                raise RuntimeError("Listener chưa sẵn sàng trước timeout.")
-            log("bot", "البوت جاهز ويعمل الآن في المجموعات! اضغط Ctrl+C للإيقاف.")
+                raise RuntimeError("Listener لم يستجب قبل انتهاء المهلة.")
+            log("bot", "البوت نشط ويعمل الآن في المجموعات 24/7 على Railway!")
             while True:
                 if listener_task.done():
                     listener_task.result()
-                    raise RuntimeError("Listener قد توقف بشكل مفاجئ.")
+                    raise RuntimeError("توقف اتصال MQTT بشكل غير متوقع.")
                 event = await self._get_event(timeout=1.0)
                 message = self._message_from_event(event) if event else None
                 if message is not None:
@@ -229,7 +247,7 @@ class SimpleBot:
             loop.call_soon_threadsafe(self._queue_event, event)
         except RuntimeError:
             if self.debug_errors:
-                log("queue", "Bỏ qua event vì asyncio loop đã đóng.")
+                log("queue", "تجاهل الحدث بسبب إغلاق حلقة الأحداث.")
 
     def _queue_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -244,12 +262,6 @@ class SimpleBot:
                 self._event_queue.get_nowait()
             self._event_queue.put_nowait(event)
             self._dropped_message_events += 1
-            if self._dropped_message_events & (self._dropped_message_events - 1) == 0:
-                log(
-                    "queue",
-                    "Queue message đầy; đã loại "
-                    f"{self._dropped_message_events} event cũ.",
-                )
 
     def _remember_message_id(self, message_id: str) -> bool:
         if message_id in self._recent_message_id_set:
@@ -279,11 +291,11 @@ class SimpleBot:
             "disconnected",
             "closed",
         }:
-            log("mqtt", str(event_type))
+            log("status", str(event_type))
             return None
         if event_type == "error":
             if self.debug_errors:
-                log("mqtt", f"Error: {data}")
+                log("error", f"خطأ الاتصال: {data}")
             return None
         if event_type not in MESSAGE_EVENT_TYPES:
             return None
@@ -311,15 +323,13 @@ class SimpleBot:
         if not message_id or not sender_id or not isinstance(body, str) or not body:
             return
 
+        # تجاهل رسائل البوت نفسه
         if sender_id == str(self.dataFB.get("FacebookID")):
             return
+
         target = message.get("chatJid") or message.get("replyToID")
-        body_for_log = (
-            repr(body)
-            if self.log_message_content
-            else f"<redacted length={len(str(body))}>"
-        )
-        log("recv", f"[{message.get('type')}] {sender_id}@{target}: {body_for_log}")
+        log("recv", f"[{message.get('type')}] من {sender_id} في {target}: {body}")
+
         if not str(body).startswith(self.prefix):
             return
 
@@ -337,8 +347,8 @@ class SimpleBot:
         try:
             await handler(message, argument)
         except Exception as error:
+            log("err", f"خطأ عند تنفيذ /{command}: {error}")
             if self.debug_errors:
-                log("err", f"Error /{command}: {error}")
                 traceback.print_exc()
 
     async def _reply(self, message: dict[str, Any], content: str) -> None:
@@ -353,7 +363,7 @@ class SimpleBot:
             message_id = result.get("messageId") or result.get("id")
             if message_id:
                 self._last_bot_message[str(chat_jid)] = (str(chat_jid), str(message_id))
-                log("send", f"E2EE -> {chat_jid}: {content}")
+                log("send", f"خاص (E2EE) -> {chat_jid}: {content}")
             return
 
         thread_id = message.get("replyToID")
@@ -366,7 +376,7 @@ class SimpleBot:
         )
         message_id = result.get("messageId") or result.get("id")
         if message_id:
-            log("send", f"Group -> {thread_id}: {content}")
+            log("send", f"مجموعة -> {thread_id}: {content}")
 
     async def _cmd_ping(self, message: dict[str, Any], argument: str) -> None:
         sent_ts = int(message.get("timestamp") or 0)
@@ -380,19 +390,20 @@ class SimpleBot:
         await self._reply(
             message,
             "📖 الأوامر المتاحة:\n"
-            f"• {prefix}ping - فحص سرعة استجابة البوت\n"
-            f"• {prefix}help - قائمة المساعدة\n"
+            f"• {prefix}ping - قياس سرعة استجابة البوت\n"
+            f"• {prefix}help - قائمة الأوامر\n"
             f"• {prefix}id - عرض الآيدي الخاص بك والمجموعة\n"
             f"• {prefix}echo <نص> - تكرار الكلام\n"
-            f"• {prefix}search <اسم> - البحث عن حسابات فيسبوك",
+            f"• {prefix}search <اسم> - البحث في فيسبوك\n"
+            f"• {prefix}unsend - سحب آخر رسالة للبوت",
         )
 
     async def _cmd_id(self, message: dict[str, Any], argument: str) -> None:
         await self._reply(
             message,
-            f"🆔 نوع المحادثة: {message.get('type')}\n"
+            f"🆔 نوع الشات: {message.get('type')}\n"
             f"آيدي المجموعة: {message.get('replyToID')}\n"
-            f"آيدي حسابك: {message.get('userID')}\n"
+            f"آيدي المرسل: {message.get('userID')}\n"
             f"آيدي الرسالة: {message.get('messageID')}",
         )
 
@@ -420,11 +431,11 @@ class SimpleBot:
     async def _cmd_unsend(self, message: dict[str, Any], argument: str) -> None:
         sender_id = str(message.get("userID") or "")
         if self.admins and sender_id not in self.admins:
-            await self._reply(message, "⛔ هذا الأمر خاص بالمطور فقط.")
+            await self._reply(message, "⛔ هذا الأمر مخصص للمسؤول فقط.")
             return
         chat_jid = str(message.get("chatJid") or "")
         if not chat_jid:
-            await self._reply(message, "الحذف مدعوم في الرسائل المباشرة فقط.")
+            await self._reply(message, "الحذف مدعوم فقط في المحادثات الفردية حالياً.")
             return
         target = self._last_bot_message.get(chat_jid)
         if not target:
@@ -441,19 +452,23 @@ async def main() -> None:
     config = load_config()
     log("boot", "جاري قراءة الجلسة وتسجيل الدخول...")
 
-    # التحقق من وجود appstate.json أولاً
-    appstate_cookies = get_appstate_cookies()
-    if appstate_cookies:
-        dataFB = await dataGetHome(appstate_cookies)
-    else:
-        log("boot", "لم يتم العثور على appstate.json، المحاولة عبر config.json...")
-        dataFB = await dataGetHome(
-            storage=FileSessionStorage(str(CONFIG_PATH), key="cookies")
+    # الأولوية 1: ملف appstate.json إذا كان موجوداً
+    cookies_source = get_appstate_cookies()
+
+    # الأولوية 2: الكوكيز المخزنة داخل config.json
+    if not cookies_source and config.get("cookies"):
+        cookies_source = str(config["cookies"]).strip()
+
+    if not cookies_source:
+        raise RuntimeError(
+            "لم يتم العثور على أي كوكيز! تأكد من وجود ملف appstate.json أو كتابة الكوكيز في config.json."
         )
+
+    dataFB = await dataGetHome(cookies_source)
 
     if not is_valid_datafb(dataFB):
         raise RuntimeError(
-            "فشل استخراج جلسة Facebook! تأكد من صحة ملف appstate.json أو تجديده."
+            "فشل استخراج جلسة Facebook! تأكد من تحديث الكوكيز / appstate.json لتجاوز الفحص الأمني."
         )
 
     async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT) as http_client:
@@ -472,8 +487,8 @@ def main_blocking() -> None:
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log("bot", "تم إيقاف البوت بنجاح.")
-    except (RuntimeError, ValueError, json.JSONDecodeError) as error:
+        log("bot", "تم إيقاف تشغيل البوت بنجاح.")
+    except Exception as error:
         log("boot", f"❌ {error}")
         raise SystemExit(1) from error
 
