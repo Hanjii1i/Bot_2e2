@@ -1,38 +1,63 @@
-"""بوت الخاص (DMs) مع فحص كود connect_client واعتراض أحداث الجسر بأمان."""
+"""بوت الخاص (DMs) مع دعم E2EE ومزامنة Lightspeed الموسعة."""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-# كتم طلبات HTTP العادية فقط
+# تفضيل IPv4 لتفادي تعليق اتصال خوادم الماسنجر
+os.environ["GODEBUG"] = "netdns=cgo"
+try:
+    gai_conf = Path("/etc/gai.conf")
+    if not gai_conf.exists() or "precedence ::ffff:0:0/96 100" not in gai_conf.read_text(encoding="utf-8", errors="ignore"):
+        with open("/etc/gai.conf", "a", encoding="utf-8") as f:
+            f.write("\nprecedence ::ffff:0:0/96 100\n")
+except Exception:
+    pass
+
+# كتم سجلات HTTP غير الضرورية
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# تجاوز فحص الإصدار
+# استيراد وتعديل إعدادات الجسر
 from _messaging._listening_e2ee import _BridgeProcess, listeningE2EEEvent
+
+# 1. إلغاء فحص تطابق الإصدار الشكلي
 _BridgeProcess._validate_contract = lambda self: None
 
-# اعتراض أحداث الجسر بعد تحليل الـ JSON لطباعتها دون كسر الاتصال
-original_dispatch = getattr(_BridgeProcess, "_dispatch_event", None)
-if original_dispatch:
-    def hooked_dispatch(self, event: dict[str, Any]) -> None:
-        try:
-            etype = event.get("type") or event.get("event")
-            print(f"[BRIDGE-EVENT] نوع الحدث: {etype} | البيانات: {str(event)[:250]}", flush=True)
-        except Exception:
-            pass
-        return original_dispatch(self, event)
-    _BridgeProcess._dispatch_event = hooked_dispatch
+# 2. رفع مهلة انتظار مزامنة رسائل فيسبوك (Lightspeed DB) إلى 180 ثانية
+_BridgeProcess.REGULAR_READY_TIMEOUT = 180.0
+_BridgeProcess.E2EE_READY_TIMEOUT = 180.0
+
+# 3. توجيه مخرجات stderr فقط لقراءة تشخيص الجسر بأمان تام دون لمس stdout
+original_spawn = _BridgeProcess._spawn
+
+def safe_spawn_with_stderr(self) -> None:
+    original_spawn(self)
+
+    def stream_stderr(pipe):
+        if not pipe:
+            return
+        for line in iter(pipe.readline, ""):
+            if not line:
+                break
+            text = line.strip()
+            if text:
+                print(f"[BRIDGE-LOG] {text}", flush=True)
+
+    if getattr(self, "_proc", None) and self._proc.stderr:
+        threading.Thread(target=stream_stderr, args=(self._proc.stderr,), daemon=True).start()
+
+_BridgeProcess._spawn = safe_spawn_with_stderr
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -57,7 +82,7 @@ def load_config() -> dict[str, Any]:
             cfg = json.load(f)
             default_config.update(cfg)
     except Exception as e:
-        log("config", f"تحذير: ({e}) - استخراج الكوكيز...")
+        log("config", f"تحذير: ({e}) - محاولة استخراج الكوكيز...")
         try:
             raw = CONFIG_PATH.read_text(encoding="utf-8", errors="ignore")
             m = re.search(r'"cookies"\s*:\s*"(.*?)"', raw)
@@ -82,7 +107,7 @@ def setup_bridge() -> Path | None:
             break
 
     if not selected:
-        log("bridge", "❌ لم يتم العثور على ملف الجسر!")
+        log("bridge", "❌ لم يتم العثور على ملف الجسر في مسار build!")
         return None
 
     try:
@@ -95,17 +120,6 @@ def setup_bridge() -> Path | None:
     return selected
 
 
-def inspect_connect_client() -> None:
-    """طباعة الأسطر المسؤولة عن انتظار الجاهزية داخل دالة connect_client."""
-    try:
-        lines, start = inspect.getsourcelines(_BridgeProcess.connect_client)
-        log("inspect", f"كود connect_client (يبدأ من سطر {start}):")
-        for idx, line in enumerate(lines):
-            print(f"  {start + idx}: {line.rstrip()}", flush=True)
-    except Exception as e:
-        log("inspect", f"تعذر قراءة كود connect_client: {e}")
-
-
 async def main() -> None:
     config = load_config()
     cookies = str(config.get("cookies") or "").strip()
@@ -113,7 +127,6 @@ async def main() -> None:
         raise RuntimeError("لم يتم العثور على الكوكيز داخل config.json!")
 
     setup_bridge()
-    inspect_connect_client()
 
     log("boot", "جاري قراءة الجلسة وتسجيل الدخول...")
     from _core._session import dataGetHome
@@ -126,11 +139,7 @@ async def main() -> None:
     log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {bot_id}")
 
     prefix = str(config.get("prefix") or "/")
-
-    # تفعيل debug_errors ورفع مستوى سجلات الجسر إلى debug
     listener = listeningE2EEEvent(dataFB, debug_errors=True)
-    listener.log_level = "debug"
-
     events_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
     loop = asyncio.get_running_loop()
 
@@ -148,10 +157,10 @@ async def main() -> None:
 
     listener.on_message(on_event)
 
-    log("bot", "بدء تشغيل مهمة اتصال الجسر بخوادم فيسبوك...")
+    log("bot", "بدء تشغيل مهمة اتصال الجسر بخوادم فيسبوك (مهلة 180 ثانية للمزامنة)...")
     listener_task = asyncio.create_task(listener.connect_mqtt())
 
-    ready = await asyncio.to_thread(listener.wait_until_connected, 60, require_e2ee=False)
+    ready = await asyncio.to_thread(listener.wait_until_connected, 180, require_e2ee=False)
     if not ready:
         log("warn", "تأخر الرد الأولي، جاري المتابعة...")
     else:
@@ -201,7 +210,7 @@ async def main() -> None:
             elif cmd == "help":
                 msg = (
                     "📖 أوامر الخاص:\n"
-                    f"• {prefix}ping - فحص الاستجابة\n"
+                    f"• {prefix}ping - فحص سرعة الاستجابة\n"
                     f"• {prefix}id - عرض الآيدي الخاص بك\n"
                     f"• {prefix}echo <نص> - تكرار النص"
                 )
@@ -223,5 +232,5 @@ if __name__ == "__main__":
         log("bot", "تم إيقاف البوت.")
     except Exception as e:
         log("exit", f"❌ توقف بسبب: {e}")
-        time.sleep(60)
+        time.sleep(30)
         sys.exit(1)
