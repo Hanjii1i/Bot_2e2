@@ -1,4 +1,4 @@
-"""بوت الخاص (DMs) مع تجاوز فحص تطابق الإصدار وتشغيل التشفير فوراً."""
+"""بوت الخاص (DMs) مع دعم التشفير التلقائي والاستقرار الدائم."""
 
 from __future__ import annotations
 
@@ -9,16 +9,15 @@ import os
 import re
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
-# كتم نصوص الاتصال الزائدة
+# كتم السجلات الزائدة لتبقى الشاشة واضحة
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# تجاوز فحص تطابق إصدار الجسر الشكلي
+# تجاوز فحص الإصدار الشكلي
 from _messaging._listening_e2ee import _BridgeProcess, listeningE2EEEvent
 _BridgeProcess._validate_contract = lambda self: None
 
@@ -76,7 +75,7 @@ def setup_bridge() -> Path | None:
     try:
         selected.chmod(0o755)
         os.environ["FBCHAT_E2EE_BIN"] = str(selected)
-        log("bridge", f"تم تجهيز جسر التشفير وتجاوز فحص الإصدار: {selected}")
+        log("bridge", f"تم تجهيز جسر التشفير بنجاح: {selected}")
     except Exception as e:
         log("bridge-err", f"خطأ في الصلاحيات: {e}")
 
@@ -107,46 +106,82 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
 
     def on_event(event: dict[str, Any]) -> None:
-        if isinstance(event, dict) and event.get("type") in {"e2eeMessage", "message"}:
+        if not isinstance(event, dict):
+            return
+        etype = event.get("type")
+        
+        # متابعة كل حالات اتصال الجسر
+        if etype == "ready":
+            log("status", "✅ تم الاتصال بخوادم فيسبوك بنجاح (MQTT Ready)!")
+        elif etype == "e2eeConnected":
+            log("status", "🔐 تم تفعيل تشفير الخاص E2EE بنجاح تام!")
+        elif etype == "error":
+            log("bridge-warn", f"تنبيه: {event.get('data')}")
+        elif etype in {"disconnected", "closed"}:
+            log("bridge-status", f"حالة الجسر: {etype}")
+
+        # استقبال رسائل الخاص وتمريرها
+        if etype in {"e2eeMessage", "message"}:
             loop.call_soon_threadsafe(events_queue.put_nowait, event)
 
     listener.on_message(on_event)
 
-    log("bot", "جاري بدء الاتصال بخوادم التشفير (E2EE Handshake)...")
+    log("bot", "جاري تشغيل مهمة الاستماع والاتصال...")
     listener_task = asyncio.create_task(listener.connect_mqtt())
 
-    ready = await asyncio.to_thread(listener.wait_until_connected, 60, require_e2ee=True)
+    # انتظار الجاهزية بدون قتل السكربت عند انتهاء المهلة
+    ready = await asyncio.to_thread(listener.wait_until_connected, 60, require_e2ee=False)
     if not ready:
-        raise RuntimeError("انتهت مهلة انتظار اتصال خوادم التشفير.")
-
-    log("bot", "🟢 البوت نشط الآن ومشفر ويعمل في الخاص (DMs) 24/7!")
+        log("warn", "تأخر الرد الأولي، لكن الاستماع مستمر في الخلفية...")
+    else:
+        log("bot", "🟢 البوت متصل الآن ويعمل في الخاص (DMs) 24/7!")
 
     try:
         while True:
-            event = await events_queue.get()
+            if listener_task.done():
+                exc = listener_task.exception()
+                if exc:
+                    log("fatal", f"توقفت مهمة الاتصال: {exc}")
+                    raise exc
+
+            try:
+                event = await asyncio.wait_for(events_queue.get(), timeout=2.0)
+            except asyncio.TimeoutError:
+                continue
+
             data = event.get("data") or {}
-            body = data.get("text") or ""
+            body = data.get("text") or data.get("body") or ""
             chat_jid = data.get("chatJid")
-            sender_id = str(data.get("senderId") or "")
-            msg_id = str(data.get("id") or "")
+            thread_id = data.get("threadId") or data.get("replyToID")
+            sender_id = str(data.get("senderId") or data.get("senderID") or data.get("userID") or "")
+            msg_id = str(data.get("id") or data.get("messageID") or "")
 
-            if not body or sender_id == bot_id or not chat_jid:
+            if not body or sender_id == bot_id:
                 continue
 
-            log("recv", f"رسالة خاصة من {sender_id}: {body}")
+            log("recv", f"📩 رسالة خاصة من {sender_id}: {body}")
 
-            if not body.startswith(prefix):
+            if not str(body).startswith(prefix):
                 continue
 
-            cmd_text = body[len(prefix) :].strip()
+            cmd_text = str(body)[len(prefix) :].strip()
             parts = cmd_text.split(maxsplit=1)
             cmd = parts[0].lower()
             arg = parts[1] if len(parts) > 1 else ""
 
+            # دالة رد تدعم الخاص المشفر والعادي
+            async def reply(text: str) -> None:
+                if chat_jid:
+                    await listener.send_e2ee_message(
+                        str(chat_jid), text, reply_to_id=msg_id
+                    )
+                elif thread_id:
+                    await listener.send_message(
+                        int(thread_id), text, reply_to_id=msg_id
+                    )
+
             if cmd == "ping":
-                await listener.send_e2ee_message(
-                    chat_jid, "🏓 pong! البوت شغال في الخاص ومشفر 🔒", reply_to_id=msg_id
-                )
+                await reply("🏓 pong! البوت شغال في الخاص وسريع 🚀")
             elif cmd == "help":
                 msg = (
                     "📖 أوامر الخاص:\n"
@@ -154,14 +189,11 @@ async def main() -> None:
                     f"• {prefix}id - عرض الآيدي الخاص بك\n"
                     f"• {prefix}echo <نص> - تكرار النص"
                 )
-                await listener.send_e2ee_message(chat_jid, msg, reply_to_id=msg_id)
+                await reply(msg)
             elif cmd == "id":
-                await listener.send_e2ee_message(
-                    chat_jid, f"🆔 آيدي حسابك: {sender_id}", reply_to_id=msg_id
-                )
+                await reply(f"🆔 آيدي حسابك: {sender_id}")
             elif cmd == "echo":
-                reply = arg if arg else f"الاستخدام: {prefix}echo <نص>"
-                await listener.send_e2ee_message(chat_jid, reply, reply_to_id=msg_id)
+                await reply(arg if arg else f"الاستخدام: {prefix}echo <نص>")
 
     finally:
         listener.stop()
@@ -174,6 +206,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("bot", "تم إيقاف البوت.")
     except Exception as e:
-        log("fatal", f"❌ {e}")
+        log("exit", f"❌ {e}")
         time.sleep(60)
         sys.exit(1)
