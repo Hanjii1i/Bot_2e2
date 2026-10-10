@@ -1,7 +1,7 @@
 {
   "botName": "fbchat",
   "prefix": "/",
-  "cookies": "dbln=%7B%2261594761797989%22%3A%22i01q7l9O%22%2C%2261594966662982%22%3A%22nW30REBR%22%7D; datr=crrCapWFZU2n6Xj4rmN4wnbt; sb=crrCag2DSbbLHY1frrYAI8BQ; locale=en_US; ps_l=1; ps_n=1; dpr=3.25; vpd=v1%3B690x375x3.25; pas=61595175298072%3AVNiiFE4In1%2C61594761797989%3A6wtL7ECzWb%2C61594966662982%3AqT5sosewTk; c_user=61594761797989; xs=42%3ADj3bc53041osKw%3A2%3A1791617849%3A-1%3A-1; wd=980x1802; fr=1SFySvPBaXaMBv9b2.AWcKTUOtDPV_Ugq6JwTjeueDd7zOvW2h_20K1QXmjwSe9uBVmTE.BqyVtn..AAA.0.0.Bqyo3-.AWeX-UvlSr5NOquOvX7KQYT694M; wl_cbv=v2%3Bclient_version%3A3320%3Btimestamp%3A1791659518; fbl_st=100421945%3BT%3A29860950",
+  "cookies": "dbln=%7B%2261594761797989%22%3A%22KEPHT8Vn%22%2C%2261594966662982%22%3A%22XcgufpIv%22%7D; datr=crrCapWFZU2n6Xj4rmN4wnbt; sb=crrCag2DSbbLHY1frrYAI8BQ; locale=en_US; ps_l=1; ps_n=1; dpr=3.25; vpd=v1%3B690x375x3.25; pas=61595175298072%3AVNiiFE4In1%2C61594761797989%3A6wtL7ECzWb%2C61594966662982%3AqT5sosewTk; oo=v1; m_pixel_ratio=3.25; wd=376x835; c_user=61594966662982; xs=41%3Avd_PvS8WtbkUYQ%3A2%3A1791661815%3A-1%3A-1; fr=0xUgs7ygWNFSQwCl6.AWfcPKwk3ND4-kI_FYWqVIqsgHH-F9O1W9IKo7DbP5EPQPMYjBU.Bqypb1..AAA.0.0.Bqypb5.AWfsdmwbzB5N7UN3G3ma8RtCe2Y; wl_cbv=v2%3Bclient_version%3A3320%3Btimestamp%3A1791661817; fbl_st=101226758%3BT%3A29860970",
   "admins": [
     "61594814231953"
   ],
@@ -9,3 +9,4 @@
   "debug_errors": false,
   "version": "0.0.1"
 }
+
