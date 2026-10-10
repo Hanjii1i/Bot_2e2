@@ -1,24 +1,57 @@
-"""بوت الخاص (DMs) مع دعم E2EE والتجاوز السليم لفحص الإصدار."""
+"""بوت الخاص (DMs) مع معالجة توجيه الشبكة وقراءة سجلات الجسر الآمنة."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-# كتم السجلات الزائدة للحفاظ على نظافة الشاشة
+# إجبار Go على تفضيل IPv4 لتفادي تعليق اتصال MQTT
+os.environ["GODEBUG"] = "netdns=cgo"
+try:
+    gai_conf = Path("/etc/gai.conf")
+    if not gai_conf.exists() or "precedence ::ffff:0:0/96 100" not in gai_conf.read_text(encoding="utf-8", errors="ignore"):
+        with open("/etc/gai.conf", "a", encoding="utf-8") as f:
+            f.write("\nprecedence ::ffff:0:0/96 100\n")
+except Exception:
+    pass
+
+# كتم طلبات HTTP الزائدة
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# تجاوز فحص الإصدار الشكلي فقط (دون المساس بأنبوب القراءة)
+# تجاوز فحص الإصدار
 from _messaging._listening_e2ee import _BridgeProcess, listeningE2EEEvent
+
+original_spawn = _BridgeProcess._spawn
+
+def safe_spawn_with_stderr(self) -> None:
+    original_spawn(self)
+
+    # قراءة قناة stderr فقط دون لمس stdout لحماية الـ JSON
+    def stream_stderr(pipe):
+        if not pipe:
+            return
+        for line in iter(pipe.readline, ""):
+            if not line:
+                break
+            text = line.strip()
+            if text:
+                print(f"[BRIDGE-LOG] {text}", flush=True)
+
+    if getattr(self, "_proc", None) and self._proc.stderr:
+        threading.Thread(target=stream_stderr, args=(self._proc.stderr,), daemon=True).start()
+
+_BridgeProcess._spawn = safe_spawn_with_stderr
 _BridgeProcess._validate_contract = lambda self: None
 
 HERE = Path(__file__).resolve().parent
@@ -82,6 +115,17 @@ def setup_bridge() -> Path | None:
     return selected
 
 
+def print_internal_mqtt_logic() -> None:
+    """طباعة الأسطر المسؤولة عن انتظار اتصال MQTT داخلياً."""
+    try:
+        src_lines, start_line = inspect.getsourcelines(listeningE2EEEvent.connect_mqtt_blocking)
+        log("inspect", "فحص شرط الاتصال الداخلي:")
+        for idx, line in enumerate(src_lines[15:45]):
+            print(f"  {start_line + 15 + idx}: {line.rstrip()}", flush=True)
+    except Exception as e:
+        log("inspect", f"تعذر قراءة الكود الداخلي: {e}")
+
+
 async def main() -> None:
     config = load_config()
     cookies = str(config.get("cookies") or "").strip()
@@ -89,6 +133,7 @@ async def main() -> None:
         raise RuntimeError("لم يتم العثور على الكوكيز داخل config.json!")
 
     setup_bridge()
+    print_internal_mqtt_logic()
 
     log("boot", "جاري قراءة الجلسة وتسجيل الدخول...")
     from _core._session import dataGetHome
@@ -101,7 +146,7 @@ async def main() -> None:
     log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {bot_id}")
 
     prefix = str(config.get("prefix") or "/")
-    listener = listeningE2EEEvent(dataFB, debug_errors=False)
+    listener = listeningE2EEEvent(dataFB, debug_errors=True)
     events_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
     loop = asyncio.get_running_loop()
 
@@ -109,7 +154,6 @@ async def main() -> None:
         if not isinstance(event, dict):
             return
         etype = event.get("type")
-
         if etype == "ready":
             log("status", "✅ تم الاتصال بخوادم فيسبوك واستقبال إشارة Ready!")
         elif etype == "e2eeConnected":
@@ -123,7 +167,6 @@ async def main() -> None:
     log("bot", "بدء تشغيل مهمة اتصال الجسر بخوادم فيسبوك...")
     listener_task = asyncio.create_task(listener.connect_mqtt())
 
-    # انتظار إشارة ready (التي يستجيب لها الجسر في ثوانٍ معدودة)
     ready = await asyncio.to_thread(listener.wait_until_connected, 60, require_e2ee=False)
     if not ready:
         log("warn", "تأخر الرد الأولي، جاري المتابعة...")
@@ -165,13 +208,9 @@ async def main() -> None:
 
             async def reply(text: str) -> None:
                 if chat_jid:
-                    await listener.send_e2ee_message(
-                        str(chat_jid), text, reply_to_id=msg_id
-                    )
+                    await listener.send_e2ee_message(str(chat_jid), text, reply_to_id=msg_id)
                 elif thread_id:
-                    await listener.send_message(
-                        int(thread_id), text, reply_to_id=msg_id
-                    )
+                    await listener.send_message(int(thread_id), text, reply_to_id=msg_id)
 
             if cmd == "ping":
                 await reply("🏓 pong! البوت شغال في الخاص ومشفر 🔒")
