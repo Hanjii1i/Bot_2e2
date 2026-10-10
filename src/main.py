@@ -1,4 +1,4 @@
-"""بوت الخاص (DMs) مع معالجة توجيه الشبكة وقراءة سجلات الجسر الآمنة."""
+"""بوت الخاص (DMs) مع فحص كود connect_client واعتراض أحداث الجسر بأمان."""
 
 from __future__ import annotations
 
@@ -9,50 +9,30 @@ import logging
 import os
 import re
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
 
-# إجبار Go على تفضيل IPv4 لتفادي تعليق اتصال MQTT
-os.environ["GODEBUG"] = "netdns=cgo"
-try:
-    gai_conf = Path("/etc/gai.conf")
-    if not gai_conf.exists() or "precedence ::ffff:0:0/96 100" not in gai_conf.read_text(encoding="utf-8", errors="ignore"):
-        with open("/etc/gai.conf", "a", encoding="utf-8") as f:
-            f.write("\nprecedence ::ffff:0:0/96 100\n")
-except Exception:
-    pass
-
-# كتم طلبات HTTP الزائدة
+# كتم طلبات HTTP العادية فقط
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # تجاوز فحص الإصدار
 from _messaging._listening_e2ee import _BridgeProcess, listeningE2EEEvent
-
-original_spawn = _BridgeProcess._spawn
-
-def safe_spawn_with_stderr(self) -> None:
-    original_spawn(self)
-
-    # قراءة قناة stderr فقط دون لمس stdout لحماية الـ JSON
-    def stream_stderr(pipe):
-        if not pipe:
-            return
-        for line in iter(pipe.readline, ""):
-            if not line:
-                break
-            text = line.strip()
-            if text:
-                print(f"[BRIDGE-LOG] {text}", flush=True)
-
-    if getattr(self, "_proc", None) and self._proc.stderr:
-        threading.Thread(target=stream_stderr, args=(self._proc.stderr,), daemon=True).start()
-
-_BridgeProcess._spawn = safe_spawn_with_stderr
 _BridgeProcess._validate_contract = lambda self: None
+
+# اعتراض أحداث الجسر بعد تحليل الـ JSON لطباعتها دون كسر الاتصال
+original_dispatch = getattr(_BridgeProcess, "_dispatch_event", None)
+if original_dispatch:
+    def hooked_dispatch(self, event: dict[str, Any]) -> None:
+        try:
+            etype = event.get("type") or event.get("event")
+            print(f"[BRIDGE-EVENT] نوع الحدث: {etype} | البيانات: {str(event)[:250]}", flush=True)
+        except Exception:
+            pass
+        return original_dispatch(self, event)
+    _BridgeProcess._dispatch_event = hooked_dispatch
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -115,15 +95,15 @@ def setup_bridge() -> Path | None:
     return selected
 
 
-def print_internal_mqtt_logic() -> None:
-    """طباعة الأسطر المسؤولة عن انتظار اتصال MQTT داخلياً."""
+def inspect_connect_client() -> None:
+    """طباعة الأسطر المسؤولة عن انتظار الجاهزية داخل دالة connect_client."""
     try:
-        src_lines, start_line = inspect.getsourcelines(listeningE2EEEvent.connect_mqtt_blocking)
-        log("inspect", "فحص شرط الاتصال الداخلي:")
-        for idx, line in enumerate(src_lines[15:45]):
-            print(f"  {start_line + 15 + idx}: {line.rstrip()}", flush=True)
+        lines, start = inspect.getsourcelines(_BridgeProcess.connect_client)
+        log("inspect", f"كود connect_client (يبدأ من سطر {start}):")
+        for idx, line in enumerate(lines):
+            print(f"  {start + idx}: {line.rstrip()}", flush=True)
     except Exception as e:
-        log("inspect", f"تعذر قراءة الكود الداخلي: {e}")
+        log("inspect", f"تعذر قراءة كود connect_client: {e}")
 
 
 async def main() -> None:
@@ -133,7 +113,7 @@ async def main() -> None:
         raise RuntimeError("لم يتم العثور على الكوكيز داخل config.json!")
 
     setup_bridge()
-    print_internal_mqtt_logic()
+    inspect_connect_client()
 
     log("boot", "جاري قراءة الجلسة وتسجيل الدخول...")
     from _core._session import dataGetHome
@@ -146,7 +126,11 @@ async def main() -> None:
     log("bot", f"تم تسجيل الدخول بنجاح! آيدي الحساب: {bot_id}")
 
     prefix = str(config.get("prefix") or "/")
+
+    # تفعيل debug_errors ورفع مستوى سجلات الجسر إلى debug
     listener = listeningE2EEEvent(dataFB, debug_errors=True)
+    listener.log_level = "debug"
+
     events_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1000)
     loop = asyncio.get_running_loop()
 
